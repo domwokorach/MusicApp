@@ -1,0 +1,23 @@
+# Render.com blueprint: deploys the backend with HTTPS. Secrets are set in the Render dashboard (sync: false).
+services:
+  - type: web
+    name: sonara-backend
+    runtime: docker
+    rootDir: backend
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /api/health
+    envVars:
+      - key: JAMENDO_CLIENT_ID
+        sync: false
+      - key: JAMENDO_CLIENT_SECRET
+        sync: false
+      - key: SPOTIFY_CLIENT_ID
+        sync: false
+      - key: SPOTIFY_CLIENT_SECRET
+        sync: false
+      - key: PUBLIC_BASE_URL # e.g. https://sonara-backend.onrender.com
+        sync: false
+      - key: APP_SCHEMES
+        value: sonara
+      - key: PORT
+        value: "4000"

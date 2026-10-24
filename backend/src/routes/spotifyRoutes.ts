@@ -53,12 +53,12 @@ const redeemBody = z.object({ ticket: z.string().min(20).max(200) });
 
 spotifyApiRouter.post('/auth/start', wrap(async (req, res) => {
   const { returnUrl } = startBody.parse(req.body);
-  res.json({ authorizeUrl: startAuth(returnUrl) });
+  res.json({ authorizeUrl: await startAuth(returnUrl) });
 }));
 
 spotifyApiRouter.post('/auth/redeem', wrap(async (req, res) => {
   const { ticket } = redeemBody.parse(req.body);
-  res.json({ sessionToken: redeemTicket(ticket) });
+  res.json({ sessionToken: await redeemTicket(ticket) });
 }));
 
 function sessionIdFrom(req: Request): string {
@@ -69,12 +69,12 @@ function sessionIdFrom(req: Request): string {
 }
 
 spotifyApiRouter.get('/auth/status', wrap(async (req, res) => {
-  const s = getSession(sessionIdFrom(req));
+  const s = await getSession(sessionIdFrom(req));
   res.json({ connected: true, scope: s.scope });
 }));
 
 spotifyApiRouter.post('/auth/disconnect', wrap(async (req, res) => {
-  disconnect(sessionIdFrom(req));
+  await disconnect(sessionIdFrom(req));
   res.json({ ok: true });
 }));
 
@@ -121,7 +121,7 @@ spotifyApiRouter.get(/^\/proxy(\/.*)$/, wrap(async (req, res) => {
   if (upstream.status === 401) upstream = await spotifyGet(sessionId, path, query, true); // token revoked early: refresh once
 
   if (upstream.status === 401) {
-    disconnect(sessionId);
+    await disconnect(sessionId);
     throw new AuthError('Your Spotify session expired. Connect again.', 401, 'session_expired');
   }
   const retryAfter = upstream.headers.get('retry-after');

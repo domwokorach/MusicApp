@@ -43,7 +43,9 @@
       "expo-audio",
       "expo-web-browser",
       "expo-asset",
-      "expo-secure-store"
+      "expo-secure-store",
+      "expo-status-bar",
+      "expo-image"
     ],
     "experiments": {
       "typedRoutes": true,

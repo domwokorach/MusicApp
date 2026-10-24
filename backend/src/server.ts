@@ -49,8 +49,13 @@ export function createApp() {
   return app;
 }
 
+// Vercel (and other serverless hosts) import this module and use the default export as the request handler.
+const app = createApp();
+export default app;
+
+// Long-running hosts (Docker, Render, local `npm run dev`) start the module directly and listen on a port.
 if (require.main === module) {
-  createApp().listen(config.port, () => {
+  app.listen(config.port, () => {
     console.log(`Sonara backend listening on http://localhost:${config.port}`);
   });
 }

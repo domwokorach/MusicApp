@@ -1,7 +1,17 @@
 import { createHash, randomBytes } from 'node:crypto';
 
 import { config } from '../config';
-import { SessionStore, type SpotifySession } from './sessionStore';
+import { kv, open, seal } from './kvStore';
+
+/** Spotify tokens for one signed-in app installation. They never leave the server. */
+export interface SpotifySession {
+  accessToken: string;
+  refreshToken?: string;
+  /** Epoch ms. */
+  expiresAt: number;
+  scope: string;
+  createdAt: number;
+}
 
 /**
  * Spotify Authorization Code flow with PKCE, executed entirely on the server:
@@ -21,8 +31,9 @@ export class AuthError extends Error {
   }
 }
 
-const STATE_TTL_MS = 10 * 60_000;
-const TICKET_TTL_MS = 60_000;
+const STATE_TTL_S = 600;
+const TICKET_TTL_S = 60;
+const SESSION_TTL_S = 90 * 24 * 3600;
 
 const b64url = (buf: Buffer) => buf.toString('base64url');
 const random = (bytes = 32) => b64url(randomBytes(bytes));
@@ -30,19 +41,30 @@ const random = (bytes = 32) => b64url(randomBytes(bytes));
 interface Pending {
   verifier: string;
   returnUrl: string;
-  createdAt: number;
 }
 
-const pending = new Map<string, Pending>();
-const tickets = new Map<string, { sessionId: string; createdAt: number }>();
-export const sessions = new SessionStore(config.tokenStoreFile, config.tokenEncryptionKey);
+// Everything below lives in the shared key-value store (Redis on serverless hosts), never in process memory,
+// because /start, /callback and /redeem may be served by different instances. State and tickets are read with
+// an atomic "take", which makes them single-use even under concurrent requests.
+const stateKey = (state: string) => `sp:state:${state}`;
+const ticketKey = (ticket: string) => `sp:ticket:${ticket}`;
+const sessionKey = (id: string) => `sp:session:${id}`;
 
-function sweep() {
-  const now = Date.now();
-  for (const [k, v] of pending) if (now - v.createdAt > STATE_TTL_MS) pending.delete(k);
-  for (const [k, v] of tickets) if (now - v.createdAt > TICKET_TTL_MS) tickets.delete(k);
+async function saveSession(id: string, session: SpotifySession) {
+  const json = JSON.stringify(session);
+  await kv().set(sessionKey(id), kv().kind === 'upstash' ? seal(json) : json, SESSION_TTL_S);
 }
-setInterval(sweep, 60_000).unref();
+
+async function loadSession(id: string): Promise<SpotifySession | undefined> {
+  const raw = await kv().get(sessionKey(id));
+  if (!raw) return undefined;
+  const json = kv().kind === 'upstash' ? open(raw) : raw;
+  try {
+    return json ? (JSON.parse(json) as SpotifySession) : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 /** The exact redirect URI. It must equal the value registered in the Spotify dashboard. */
 export const redirectUri = () => `${config.publicBaseUrl}/auth/spotify/callback`;
@@ -50,6 +72,7 @@ export const redirectUri = () => `${config.publicBaseUrl}/auth/spotify/callback`
 export function isConfigured(): { ok: true } | { ok: false; reason: string } {
   if (!config.spotifyClientId || !config.spotifyClientSecret) return { ok: false, reason: 'Spotify is not configured on the server (SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET).' };
   if (!config.publicBaseUrl.startsWith('https://')) return { ok: false, reason: 'PUBLIC_BASE_URL must be the public HTTPS URL of this server (for example https://api.example.com).' };
+  if (config.kvRestUrl && config.kvRestToken && !config.tokenEncryptionKey) return { ok: false, reason: 'TOKEN_ENCRYPTION_KEY is required when a shared session store (KV_REST_API_URL) is configured.' };
   return { ok: true };
 }
 
@@ -74,15 +97,13 @@ export function validateReturnUrl(raw: string): string {
   return url.toString();
 }
 
-export function startAuth(returnUrl: string): string {
+export async function startAuth(returnUrl: string): Promise<string> {
   const cfg = isConfigured();
   if (!cfg.ok) throw new AuthError(cfg.reason, 503, 'not_configured');
   const safeReturn = validateReturnUrl(returnUrl);
-  sweep();
-
   const state = random(32);
   const verifier = random(64); // 86 chars, within PKCE's 43-128
-  pending.set(state, { verifier, returnUrl: safeReturn, createdAt: Date.now() });
+  await kv().set(stateKey(state), JSON.stringify({ verifier, returnUrl: safeReturn } satisfies Pending), STATE_TTL_S);
 
   const url = new URL('/authorize', config.spotifyAccountsUrl);
   url.search = new URLSearchParams({
@@ -134,16 +155,18 @@ export interface CallbackOutcome {
 }
 
 export async function handleCallback(query: { code?: unknown; state?: unknown; error?: unknown }): Promise<CallbackOutcome> {
-  const state = typeof query.state === 'string' ? query.state : '';
-  const entry = pending.get(state);
-  if (!entry || Date.now() - entry.createdAt > STATE_TTL_MS) {
-    pending.delete(state);
-    return { failure: 'This sign-in link is invalid or has expired. Return to the app and try again.' };
+  const state = typeof query.state === 'string' && query.state.length <= 100 ? query.state : '';
+  const stored = state ? await kv().take(stateKey(state)) : null; // single-use: consumed here
+  let entry: Pending | null = null;
+  try {
+    entry = stored ? (JSON.parse(stored) as Pending) : null;
+  } catch {
+    entry = null;
   }
-  pending.delete(state); // state is single-use
+  if (!entry) return { failure: 'This sign-in link is invalid or has expired. Return to the app and try again.' };
 
   const back = (params: Record<string, string>) => {
-    const url = new URL(entry.returnUrl);
+    const url = new URL(entry!.returnUrl);
     for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
     return { redirectTo: url.toString() };
   };
@@ -159,31 +182,29 @@ export async function handleCallback(query: { code?: unknown; state?: unknown; e
   }
 
   const sessionId = random(32);
-  sessions.set(sessionId, toSession(res.json));
+  await saveSession(sessionId, toSession(res.json));
   const ticket = random(32);
-  tickets.set(ticket, { sessionId, createdAt: Date.now() });
+  await kv().set(ticketKey(ticket), sessionId, TICKET_TTL_S);
   return back({ ticket });
 }
 
 /** Exchanges a ticket for the app session token. Tickets are single-use and expire after 60 seconds. */
-export function redeemTicket(ticket: string): string {
-  sweep();
-  const entry = tickets.get(ticket);
-  tickets.delete(ticket);
-  if (!entry || Date.now() - entry.createdAt > TICKET_TTL_MS || !sessions.get(entry.sessionId)) {
+export async function redeemTicket(ticket: string): Promise<string> {
+  const sessionId = await kv().take(ticketKey(ticket));
+  if (!sessionId || !(await loadSession(sessionId))) {
     throw new AuthError('This sign-in ticket is invalid or has expired. Connect again.', 401, 'invalid_ticket');
   }
-  return entry.sessionId;
+  return sessionId;
 }
 
-export function getSession(sessionId: string): SpotifySession {
-  const s = sessions.get(sessionId);
+export async function getSession(sessionId: string): Promise<SpotifySession> {
+  const s = await loadSession(sessionId);
   if (!s) throw new AuthError('Connect your Spotify account first.', 401, 'not_connected');
   return s;
 }
 
-export function disconnect(sessionId: string) {
-  sessions.delete(sessionId);
+export async function disconnect(sessionId: string) {
+  await kv().del(sessionKey(sessionId));
 }
 
 const refreshing = new Map<string, Promise<SpotifySession>>();
@@ -193,19 +214,19 @@ async function refresh(sessionId: string, current: SpotifySession): Promise<Spot
   if (inflight) return inflight;
   const run = (async () => {
     if (!current.refreshToken) {
-      sessions.delete(sessionId);
+      await disconnect(sessionId);
       throw new AuthError('Your Spotify session expired. Connect again.', 401, 'session_expired');
     }
     const res = await tokenRequest({ grant_type: 'refresh_token', refresh_token: current.refreshToken });
     if (!res.ok || typeof res.json.access_token !== 'string') {
       if (res.json.error === 'invalid_grant' || res.status === 400 || res.status === 401) {
-        sessions.delete(sessionId); // revoked or expired refresh token: the user must sign in again
+        await disconnect(sessionId); // revoked or expired refresh token: the user must sign in again
         throw new AuthError('Your Spotify session expired. Connect again.', 401, 'session_expired');
       }
       throw new AuthError('Could not refresh the Spotify session.', 502, 'refresh_failed');
     }
     const next = toSession(res.json, current);
-    sessions.set(sessionId, next);
+    await saveSession(sessionId, next);
     return next;
   })().finally(() => refreshing.delete(sessionId));
   refreshing.set(sessionId, run);
@@ -214,7 +235,7 @@ async function refresh(sessionId: string, current: SpotifySession): Promise<Spot
 
 /** A valid access token for this session, refreshing it first if it expires within a minute. */
 export async function validAccessToken(sessionId: string, force = false): Promise<string> {
-  let s = getSession(sessionId);
+  let s = await getSession(sessionId);
   if (force || s.expiresAt - Date.now() < 60_000) s = await refresh(sessionId, s);
   return s.accessToken;
 }

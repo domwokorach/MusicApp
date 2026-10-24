@@ -39,8 +39,15 @@ app ──GET /api/spotify/proxy/…  (Bearer session token)──▶ backend ad
 
 **Why `redirect_uri: Not matching configuration` happened:** the app used to build its own redirect URI at runtime (`sonara://spotify-auth`, `exp://…` in Expo Go, an http URL on web), which can never equal the single value registered in the Spotify dashboard. Now Spotify only ever sees the backend's fixed HTTPS callback.
 
-1. **Deploy the backend over HTTPS** (a `backend/Dockerfile` and a Render blueprint `render.yaml` are included) or, for local testing, run an HTTPS tunnel: `cloudflared tunnel --url http://localhost:4000` (or `ngrok http 4000`). Quick tunnels get a new URL every run, so use a named tunnel or a deployed domain for anything lasting.
-2. In `backend/.env` set `SPOTIFY_CLIENT_ID`, `SPOTIFY_CLIENT_SECRET` and `PUBLIC_BASE_URL=https://YOUR_BACKEND_DOMAIN` (no trailing slash). Restart the backend.
+1. **Deploy the backend over HTTPS.** On **Vercel**:
+   - New Project → import the GitHub repo → **Root Directory: `backend`** (framework: Express is auto-detected; `backend/vercel.json` only sets the build command). `src/server.ts` exports the Express app as Vercel requires.
+   - Storage / Marketplace → add **Upstash Redis** to the project. Vercel functions are stateless, so login state, tickets and Spotify sessions live in Redis (tokens are AES-256-GCM encrypted first). It supplies `KV_REST_API_URL` and `KV_REST_API_TOKEN`.
+   - Settings → Environment Variables (Production): `JAMENDO_CLIENT_ID`, `JAMENDO_CLIENT_SECRET`, `SPOTIFY_CLIENT_ID`, `SPOTIFY_CLIENT_SECRET`, `TOKEN_ENCRYPTION_KEY` (`openssl rand -base64 48`), `APP_SCHEMES=sonara`, and `PUBLIC_BASE_URL=https://<your-production-domain>`. **Redeploy** after changing variables.
+   - Use the **production** domain (`https://<project>.vercel.app` or your custom domain) everywhere: preview URLs change per deployment and Vercel's Deployment Protection would also block Spotify and the phone from reaching a protected deployment. Check `https://<domain>/api/health` in a browser returns `{"ok":true}` without a Vercel login page.
+   - Rate limiting is per function instance on serverless; add a Vercel Firewall rate-limit rule for production.
+
+   Other hosts: a `backend/Dockerfile` and `render.yaml` are included (an in-memory session store works on a single long-running server; add Upstash for several instances). For local testing use an HTTPS tunnel: `cloudflared tunnel --url http://localhost:4000`.
+2. In the backend environment set the values above. Locally copy `backend/.env.example` to `backend/.env`.
 3. In the [Spotify dashboard](https://developer.spotify.com/dashboard) → your app → Settings → **Redirect URIs**, add exactly `https://YOUR_BACKEND_DOMAIN/auth/spotify/callback` (same scheme, host, path, capitalisation, no trailing slash) and save. Nothing else is needed: no `sonara://` or `exp://` URL goes in the dashboard.
 4. Point the app at the same backend: `EXPO_PUBLIC_API_URL=https://YOUR_BACKEND_DOMAIN` (a physical phone cannot reach `localhost`), then `npx expo start --clear` with a **development build** (`npx expo run:ios` / `run:android`). Expo Go is not supported for the return link.
 5. Podcasts tab → **Connect Spotify**.

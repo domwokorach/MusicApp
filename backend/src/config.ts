@@ -23,8 +23,14 @@ export const config = {
   spotifyScopes: 'user-read-recently-played user-library-read',
   /** URL schemes the app may be returned to after login (comma separated). */
   appSchemes: (process.env.APP_SCHEMES ?? 'sonara').split(',').map((s) => s.trim().toLowerCase()).filter(Boolean),
-  /** Optional file + key to keep Spotify sessions across restarts (AES-256-GCM encrypted). */
-  tokenStoreFile: process.env.TOKEN_STORE_FILE?.trim() || undefined,
+  /**
+   * Shared Redis (Upstash REST) for OAuth state, login tickets and Spotify sessions. REQUIRED on serverless hosts
+   * such as Vercel, where consecutive requests can run on different instances. Without it an in-memory store is used
+   * (fine for a single long-running server and for local development).
+   */
+  kvRestUrl: (process.env.KV_REST_API_URL ?? process.env.UPSTASH_REDIS_REST_URL)?.trim() || undefined,
+  kvRestToken: (process.env.KV_REST_API_TOKEN ?? process.env.UPSTASH_REDIS_REST_TOKEN)?.trim() || undefined,
+  /** Secret used to encrypt Spotify tokens (AES-256-GCM) before they are written to the shared store. */
   tokenEncryptionKey: process.env.TOKEN_ENCRYPTION_KEY?.trim() || undefined,
   spotifyAccountsUrl: process.env.SPOTIFY_ACCOUNTS_URL ?? 'https://accounts.spotify.com',
   spotifyApiUrl: process.env.SPOTIFY_API_URL ?? 'https://api.spotify.com/v1',
